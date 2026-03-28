@@ -117,6 +117,34 @@ result = parse_file(
 
 Without hints, xlsx2semantic auto-detects headers using a text/numeric ratio heuristic.
 
+## Multi-Level Header Support
+
+Real-world spreadsheets often have hierarchical headers spanning multiple rows. xlsx2semantic merges them into a single, structured tag name.
+
+```
+Original Excel layout (rows 4–6):
+
+Row 4:  |         | Total   |         | Race/Ethnicity                    | ...
+Row 5:  |         |         |         | American Indian | Asian           | ...
+Row 6:  | State   | Number  | Percent | Number | Percent | Number | Percent | ...
+```
+
+With `header_range="B4:*6"`, these multi-level headers become:
+
+```xml
+<schema>
+  <row-key index="2" attribute="state"/>
+  <column index="3" tag="total_number"/>
+  <column index="4" tag="total_percent"/>
+  <column index="5" tag="race_ethnicity_american_indian_number"/>
+  <column index="6" tag="race_ethnicity_american_indian_percent"/>
+  <column index="7" tag="race_ethnicity_asian_number"/>
+  <column index="8" tag="race_ethnicity_asian_percent"/>
+</schema>
+```
+
+Each header level is joined with `_`, so the full hierarchy is preserved in a flat, LLM-readable tag name. Duplicate values from merged cells are automatically deduplicated.
+
 ## Three Output Layers
 
 xlsx2semantic gives you three views of the same spreadsheet:
