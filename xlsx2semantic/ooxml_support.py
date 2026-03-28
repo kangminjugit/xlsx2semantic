@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import zipfile
 from io import BytesIO
 from xml.dom import minidom
+
+logger = logging.getLogger(__name__)
 
 
 def extract_xml_entries(data: bytes) -> dict[str, str]:
@@ -34,4 +37,5 @@ def _pretty_print_xml(raw_xml: str) -> str:
         lines = [line for line in pretty.splitlines() if line.strip()]
         return "\n".join(lines)
     except Exception:
+        logger.warning("Failed to pretty-print XML entry", exc_info=True)
         return raw_xml

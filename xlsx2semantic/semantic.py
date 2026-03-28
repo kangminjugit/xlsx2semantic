@@ -24,10 +24,13 @@ Result example:
 
 from __future__ import annotations
 
+import logging
 import re
 from collections import OrderedDict
 
 from lxml import etree
+
+logger = logging.getLogger(__name__)
 
 from xlsx2semantic.layout_hint import TableLayoutHint
 
@@ -72,6 +75,7 @@ def transform(
         else:
             return _build_auto_detect(grid, all_rows)
     except Exception as e:
+        logger.warning("Failed to transform sheet to semantic XML: %s", e, exc_info=True)
         return f"<semantic-table><error>{e}</error></semantic-table>"
 
 

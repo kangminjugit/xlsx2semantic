@@ -11,9 +11,12 @@ After:
 
 from __future__ import annotations
 
+import logging
 import re
 
 from lxml import etree
+
+logger = logging.getLogger(__name__)
 
 from xlsx2semantic.style_resolver import NS, TYPE_MAP, StyleResolver
 
@@ -37,7 +40,7 @@ def parse_shared_strings(shared_strings_xml: str | None) -> list[str]:
                     texts.append(t.text)
             strings.append("".join(texts))
     except Exception:
-        pass
+        logger.warning("Failed to parse sharedStrings.xml", exc_info=True)
     return strings
 
 
@@ -50,6 +53,7 @@ def transform_sheet(
     try:
         root = etree.fromstring(sheet_xml.encode("utf-8"))
     except Exception:
+        logger.warning("Failed to parse sheet XML for cell transformation", exc_info=True)
         return sheet_xml
 
     # Collect all <c> elements

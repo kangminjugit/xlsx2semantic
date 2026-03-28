@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "xlsx2semantic"
-version = "0.1.0"
+version = "0.1.1"
 description = "Transform XLSX files into LLM-friendly semantic XML"
 readme = "README.md"
 license = "MIT"
@@ -43,9 +43,9 @@ cli = [
 xlsx2semantic = "xlsx2semantic.cli:app"
 
 [project.urls]
-Homepage = "https://github.com/kangminju/xlsx2semantic"
-Repository = "https://github.com/kangminju/xlsx2semantic"
-Issues = "https://github.com/kangminju/xlsx2semantic/issues"
+Homepage = "https://github.com/kangminjugit/xlsx2semantic"
+Repository = "https://github.com/kangminjugit/xlsx2semantic"
+Issues = "https://github.com/kangminjugit/xlsx2semantic/issues"
 
 [tool.ruff]
 line-length = 120

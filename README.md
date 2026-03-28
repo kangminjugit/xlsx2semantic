@@ -165,7 +165,7 @@ Every opaque attribute is resolved:
 ## Development
 
 ```bash
-git clone https://github.com/kangminju/xlsx2semantic.git
+git clone https://github.com/kangminjugit/xlsx2semantic.git
 cd xlsx2semantic
 pip install -e ".[dev,cli]"
 pytest -v

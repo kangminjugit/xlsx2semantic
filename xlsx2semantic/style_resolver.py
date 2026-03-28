@@ -9,8 +9,12 @@ Parses styles.xml to map style index (s="59") to human-readable properties:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
+
 from lxml import etree
+
+logger = logging.getLogger(__name__)
 
 NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 _NS_MAP = {"s": NS}
@@ -118,6 +122,7 @@ class StyleResolver:
 
             return StyleResolver(num_fmt_map, fonts, fills, cell_xfs)
         except Exception:
+            logger.warning("Failed to parse styles.xml", exc_info=True)
             return StyleResolver({}, [], [], [])
 
     def resolve(self, style_index: int) -> dict[str, str]:
