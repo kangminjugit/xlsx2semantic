@@ -50,18 +50,12 @@ def transform_sheet(
     style_resolver: StyleResolver | None = None,
 ) -> str:
     """Transform all <c> elements in sheet XML to enriched <cell> elements."""
-    # Collect all <c> elements
-    c_elements = root.iter(f"{{{NS}}}c")
-    # Need to materialize since we modify the tree
-    cells = list(c_elements)
-
-    for c in cells:
-        cell = _transform_cell(c, shared_strings, style_resolver)
-        parent = c.getparent()
-        if parent is not None:
-            idx = list(parent).index(c)
-            parent.remove(c)
-            parent.insert(idx, cell)
+    for row in root.iter(f"{{{NS}}}row"):
+        for idx, c in enumerate(list(row)):
+            if c.tag == f"{{{NS}}}c":
+                cell = _transform_cell(c, shared_strings, style_resolver)
+                row.remove(c)
+                row.insert(idx, cell)
 
     return etree.tostring(root, pretty_print=True, xml_declaration=False, encoding="unicode")
 
