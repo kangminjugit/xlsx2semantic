@@ -11,6 +11,7 @@ After:
 
 from __future__ import annotations
 
+import io
 import logging
 import re
 
@@ -31,14 +32,18 @@ def parse_shared_strings(shared_strings_xml: str | None) -> list[str]:
         return strings
 
     try:
-        root = etree.fromstring(shared_strings_xml.encode("utf-8"))
-        for si in root.findall("s:si", _NS_MAP):
-            # Collect all <t> elements (handles rich text <r><t>...</t></r>)
+        context = etree.iterparse(
+            io.BytesIO(shared_strings_xml.encode("utf-8")),
+            events=("end",),
+            tag=f"{{{NS}}}si",
+        )
+        for _, si in context:
             texts = []
             for t in si.iter(f"{{{NS}}}t"):
                 if t.text:
                     texts.append(t.text)
             strings.append("".join(texts))
+            si.clear()
     except Exception:
         logger.warning("Failed to parse sharedStrings.xml", exc_info=True)
     return strings
