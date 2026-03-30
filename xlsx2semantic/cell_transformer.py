@@ -45,17 +45,11 @@ def parse_shared_strings(shared_strings_xml: str | None) -> list[str]:
 
 
 def transform_sheet(
-    sheet_xml: str,
+    root: etree._Element,
     shared_strings: list[str],
     style_resolver: StyleResolver | None = None,
 ) -> str:
     """Transform all <c> elements in sheet XML to enriched <cell> elements."""
-    try:
-        root = etree.fromstring(sheet_xml.encode("utf-8"))
-    except Exception:
-        logger.warning("Failed to parse sheet XML for cell transformation", exc_info=True)
-        return sheet_xml
-
     # Collect all <c> elements
     c_elements = root.iter(f"{{{NS}}}c")
     # Need to materialize since we modify the tree

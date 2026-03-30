@@ -41,14 +41,14 @@ _MERGE_REF_RE = re.compile(r"^([A-Z]+)(\d+):([A-Z]+)(\d+)$")
 
 
 def transform(
-    sheet_xml: str,
+    root: etree._Element,
     shared_strings: list[str],
     hint: TableLayoutHint | None = None,
 ) -> str:
     """Transform sheet XML into semantic table XML.
 
     Args:
-        sheet_xml: Raw worksheet XML string.
+        root: Parsed worksheet XML element tree.
         shared_strings: Parsed shared string table.
         hint: Optional layout hint for explicit structure.
 
@@ -56,7 +56,6 @@ def transform(
         Semantic table XML string.
     """
     try:
-        root = etree.fromstring(sheet_xml.encode("utf-8"))
         merge_map = _build_merge_map(root)
         grid = _build_grid(root, shared_strings, merge_map)
 
@@ -428,7 +427,7 @@ def _to_tag_name(text: str) -> str:
     """Convert text to a valid XML tag name."""
     s = text.strip().lower()
     s = re.sub(r"[\r\n/]+", " ", s)
-    s = re.sub(r"[^a-z0-9 _]", "", s)
+    s = re.sub(r"[^\w\s]", "", s, flags=re.UNICODE)
     s = re.sub(r"\s+", "_", s)
     s = re.sub(r"_+", "_", s)
     s = s.strip("_")
