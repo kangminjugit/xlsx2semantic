@@ -34,7 +34,7 @@ def parse(
     Returns:
         ParseResult with xml_entries, cell_xml, and semantic_xml.
     """
-    xml_entries = extract_xml_entries(data)
+    xml_entries = extract_xml_entries(data, selective=not raw)
 
     metadata: dict[str, object] = {
         "xml_entry_count": len(xml_entries),
