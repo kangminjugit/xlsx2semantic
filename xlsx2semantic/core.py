@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from lxml import etree
+
 from xlsx2semantic.cell_transformer import parse_shared_strings, transform_sheet
 from xlsx2semantic.layout_hint import TableLayoutHint
 from xlsx2semantic.models import ParseResult
@@ -34,7 +36,7 @@ def parse(
     Returns:
         ParseResult with xml_entries, cell_xml, and semantic_xml.
     """
-    xml_entries = extract_xml_entries(data)
+    xml_entries = extract_xml_entries(data, selective=not raw)
 
     metadata: dict[str, object] = {
         "xml_entry_count": len(xml_entries),
@@ -66,12 +68,14 @@ def parse(
 
     for entry_name, entry_xml in xml_entries.items():
         if entry_name.startswith("xl/worksheets/") and entry_name.endswith(".xml"):
-            # Semantic transformation (from original XML)
-            sem = semantic_transform(entry_xml, shared_strings, layout_hint)
+            root = etree.fromstring(entry_xml.encode("utf-8"))
+
+            # Semantic transformation (read-only, must run first)
+            sem = semantic_transform(root, shared_strings, layout_hint)
             semantic_xml[entry_name] = sem
 
-            # Cell transformation (<c> → <cell>)
-            cell = transform_sheet(entry_xml, shared_strings, style_resolver)
+            # Cell transformation (<c> → <cell>, mutates tree)
+            cell = transform_sheet(root, shared_strings, style_resolver)
             cell_xml[entry_name] = cell
 
     metadata["shared_string_count"] = len(shared_strings)

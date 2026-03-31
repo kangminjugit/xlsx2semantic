@@ -11,6 +11,7 @@ After:
 
 from __future__ import annotations
 
+import io
 import logging
 import re
 
@@ -31,43 +32,35 @@ def parse_shared_strings(shared_strings_xml: str | None) -> list[str]:
         return strings
 
     try:
-        root = etree.fromstring(shared_strings_xml.encode("utf-8"))
-        for si in root.findall("s:si", _NS_MAP):
-            # Collect all <t> elements (handles rich text <r><t>...</t></r>)
+        context = etree.iterparse(
+            io.BytesIO(shared_strings_xml.encode("utf-8")),
+            events=("end",),
+            tag=f"{{{NS}}}si",
+        )
+        for _, si in context:
             texts = []
             for t in si.iter(f"{{{NS}}}t"):
                 if t.text:
                     texts.append(t.text)
             strings.append("".join(texts))
+            si.clear()
     except Exception:
         logger.warning("Failed to parse sharedStrings.xml", exc_info=True)
     return strings
 
 
 def transform_sheet(
-    sheet_xml: str,
+    root: etree._Element,
     shared_strings: list[str],
     style_resolver: StyleResolver | None = None,
 ) -> str:
     """Transform all <c> elements in sheet XML to enriched <cell> elements."""
-    try:
-        root = etree.fromstring(sheet_xml.encode("utf-8"))
-    except Exception:
-        logger.warning("Failed to parse sheet XML for cell transformation", exc_info=True)
-        return sheet_xml
-
-    # Collect all <c> elements
-    c_elements = root.iter(f"{{{NS}}}c")
-    # Need to materialize since we modify the tree
-    cells = list(c_elements)
-
-    for c in cells:
-        cell = _transform_cell(c, shared_strings, style_resolver)
-        parent = c.getparent()
-        if parent is not None:
-            idx = list(parent).index(c)
-            parent.remove(c)
-            parent.insert(idx, cell)
+    for row in root.iter(f"{{{NS}}}row"):
+        for idx, c in enumerate(list(row)):
+            if c.tag == f"{{{NS}}}c":
+                cell = _transform_cell(c, shared_strings, style_resolver)
+                row.remove(c)
+                row.insert(idx, cell)
 
     return etree.tostring(root, pretty_print=True, xml_declaration=False, encoding="unicode")
 
