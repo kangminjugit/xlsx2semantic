@@ -13,16 +13,14 @@ from __future__ import annotations
 
 import io
 import logging
-import re
+from xml.sax.saxutils import quoteattr
 
 from lxml import etree
 
 logger = logging.getLogger(__name__)
 
+from xlsx2semantic.sheet_scanner import SheetData, scan_sheet
 from xlsx2semantic.style_resolver import NS, TYPE_MAP, StyleResolver
-
-_CELL_REF_RE = re.compile(r"^([A-Z]+)(\d+)$")
-_NS_MAP = {"s": NS}
 
 
 def parse_shared_strings(shared_strings_xml: str | None) -> list[str]:
@@ -50,81 +48,77 @@ def parse_shared_strings(shared_strings_xml: str | None) -> list[str]:
 
 
 def transform_sheet(
-    root: etree._Element,
+    sheet_xml_or_data: str | SheetData,
     shared_strings: list[str],
     style_resolver: StyleResolver | None = None,
 ) -> str:
-    """Transform all <c> elements in sheet XML to enriched <cell> elements."""
-    for row in root.iter(f"{{{NS}}}row"):
-        for idx, c in enumerate(list(row)):
-            if c.tag == f"{{{NS}}}c":
-                cell = _transform_cell(c, shared_strings, style_resolver)
-                row.remove(c)
-                row.insert(idx, cell)
+    """Transform sheet XML to enriched cell XML.
 
-    return etree.tostring(root, pretty_print=True, xml_declaration=False, encoding="unicode")
+    Args:
+        sheet_xml_or_data: Raw XML string or pre-scanned SheetData.
+        shared_strings: Parsed shared string table.
+        style_resolver: Optional style resolver for cell formatting.
+
+    Returns:
+        XML string with enriched <cell> elements.
+    """
+    if isinstance(sheet_xml_or_data, SheetData):
+        data = sheet_xml_or_data
+    else:
+        data = scan_sheet(sheet_xml_or_data, shared_strings)
+
+    return _build_cell_xml(data, style_resolver)
 
 
-def _transform_cell(
-    c: etree._Element,
-    shared_strings: list[str],
-    style_resolver: StyleResolver | None,
-) -> etree._Element:
-    cell = etree.Element(f"{{{NS}}}cell")
+def _build_cell_xml(data: SheetData, style_resolver: StyleResolver | None) -> str:
+    """Build cell XML string directly from SheetData (no DOM)."""
+    parts: list[str] = [f'<worksheet xmlns="{NS}">', "<sheetData>"]
+    current_row = -1
 
-    ref = c.get("r", "")
-    cell.set("ref", ref)
+    for cell in data.cells:
+        if cell.row != current_row:
+            if current_row != -1:
+                parts.append("</row>")
+            parts.append(f'<row r="{cell.row}">')
+            current_row = cell.row
 
-    m = _CELL_REF_RE.match(ref)
-    if m:
-        cell.set("row", m.group(2))
-        cell.set("col", str(_col_to_num(m.group(1))))
+        attrs = [
+            f'ref="{cell.ref}"',
+            f'row="{cell.row}"',
+            f'col="{cell.col}"',
+        ]
 
-    # Style resolution
-    s_val = c.get("s")
-    if s_val:
-        cell.set("styleIndex", s_val)
-        if style_resolver and not style_resolver.is_empty:
-            try:
-                resolved = style_resolver.resolve(int(s_val))
-                for k, v in resolved.items():
-                    cell.set(k, v)
-            except (ValueError, IndexError):
-                pass
+        if cell.style_idx:
+            attrs.append(f'styleIndex="{cell.style_idx}"')
+            if style_resolver and not style_resolver.is_empty:
+                try:
+                    resolved = style_resolver.resolve(int(cell.style_idx))
+                    for k, v in resolved.items():
+                        attrs.append(f"{k}={quoteattr(v)}")
+                except (ValueError, IndexError):
+                    pass
 
-    # Type mapping
-    raw_type = c.get("t", "")
-    mapped_type = TYPE_MAP.get(raw_type, raw_type) if raw_type else "number"
-    cell.set("type", mapped_type)
+        mapped_type = TYPE_MAP.get(cell.cell_type, cell.cell_type) if cell.cell_type else "number"
+        attrs.append(f'type="{mapped_type}"')
 
-    # Value and formula
-    v_el = c.find(f"{{{NS}}}v")
-    if v_el is None:
-        v_el = c.find("v")
-    f_el = c.find(f"{{{NS}}}f")
-    if f_el is None:
-        f_el = c.find("f")
+        if cell.formula:
+            attrs.append(f"formula={quoteattr(cell.formula)}")
 
-    if f_el is not None and f_el.text:
-        cell.set("formula", f_el.text)
+        if cell.raw_value is not None:
+            attrs.append(f"rawValue={quoteattr(cell.raw_value)}")
 
-    if v_el is not None and v_el.text is not None:
-        raw_value = v_el.text
-        cell.set("rawValue", raw_value)
+        if cell.value is not None:
+            attrs.append(f"value={quoteattr(cell.value)}")
 
-        if raw_type == "s" and shared_strings:
-            try:
-                idx = int(raw_value)
-                if 0 <= idx < len(shared_strings):
-                    cell.set("value", shared_strings[idx])
-                else:
-                    cell.set("value", raw_value)
-            except ValueError:
-                cell.set("value", raw_value)
-        else:
-            cell.set("value", raw_value)
+        parts.append(f'<cell {" ".join(attrs)}/>')
 
-    return cell
+    if current_row != -1:
+        parts.append("</row>")
+
+    parts.append("</sheetData>")
+    parts.append("</worksheet>")
+
+    return "\n".join(parts)
 
 
 def _col_to_num(letters: str) -> int:

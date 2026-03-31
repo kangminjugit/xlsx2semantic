@@ -119,4 +119,4 @@ def test_to_tag_name():
     assert _to_tag_name("  Hello/World  ") == "hello_world"
     assert _to_tag_name("123abc") == "col_123abc"
     assert _to_tag_name("!!!") == "unknown"
-    assert _to_tag_name("Race / Ethnicity") == "race__ethnicity"
+    assert _to_tag_name("Race / Ethnicity") == "race_ethnicity"

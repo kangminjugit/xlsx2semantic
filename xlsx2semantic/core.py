@@ -4,13 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from lxml import etree
-
 from xlsx2semantic.cell_transformer import parse_shared_strings, transform_sheet
 from xlsx2semantic.layout_hint import TableLayoutHint
 from xlsx2semantic.models import ParseResult
 from xlsx2semantic.ooxml_support import extract_xml_entries
 from xlsx2semantic.semantic import transform as semantic_transform
+from xlsx2semantic.sheet_scanner import scan_sheet
 from xlsx2semantic.style_resolver import StyleResolver
 
 
@@ -68,14 +67,14 @@ def parse(
 
     for entry_name, entry_xml in xml_entries.items():
         if entry_name.startswith("xl/worksheets/") and entry_name.endswith(".xml"):
-            root = etree.fromstring(entry_xml.encode("utf-8"))
+            # Single streaming pass — no DOM tree built
+            sheet_data = scan_sheet(entry_xml, shared_strings)
 
-            # Semantic transformation (read-only, must run first)
-            sem = semantic_transform(root, shared_strings, layout_hint)
+            # Both transforms reuse the same pre-scanned data
+            sem = semantic_transform(sheet_data, shared_strings, layout_hint)
             semantic_xml[entry_name] = sem
 
-            # Cell transformation (<c> → <cell>, mutates tree)
-            cell = transform_sheet(root, shared_strings, style_resolver)
+            cell = transform_sheet(sheet_data, shared_strings, style_resolver)
             cell_xml[entry_name] = cell
 
     metadata["shared_string_count"] = len(shared_strings)

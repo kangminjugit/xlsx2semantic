@@ -33,22 +33,20 @@ from lxml import etree
 logger = logging.getLogger(__name__)
 
 from xlsx2semantic.layout_hint import TableLayoutHint
+from xlsx2semantic.sheet_scanner import SheetData, scan_sheet
 
 NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-_NS_MAP = {"s": NS}
-_CELL_REF_RE = re.compile(r"^([A-Z]+)(\d+)$")
-_MERGE_REF_RE = re.compile(r"^([A-Z]+)(\d+):([A-Z]+)(\d+)$")
 
 
 def transform(
-    root: etree._Element,
+    sheet_xml_or_data: str | SheetData,
     shared_strings: list[str],
     hint: TableLayoutHint | None = None,
 ) -> str:
     """Transform sheet XML into semantic table XML.
 
     Args:
-        root: Parsed worksheet XML element tree.
+        sheet_xml_or_data: Raw XML string or pre-scanned SheetData.
         shared_strings: Parsed shared string table.
         hint: Optional layout hint for explicit structure.
 
@@ -56,8 +54,12 @@ def transform(
         Semantic table XML string.
     """
     try:
-        merge_map = _build_merge_map(root)
-        grid = _build_grid(root, shared_strings, merge_map)
+        if isinstance(sheet_xml_or_data, SheetData):
+            data = sheet_xml_or_data
+        else:
+            data = scan_sheet(sheet_xml_or_data, shared_strings)
+
+        grid = _build_grid(data)
 
         all_rows = sorted(grid.keys())
         if not all_rows:
@@ -329,62 +331,18 @@ def _build_column_tags(
     return tags
 
 
-# ── Merge cell handling ──
-
-
-def _build_merge_map(root: etree._Element) -> dict[str, str]:
-    """Build a map from every merged cell coordinate to its origin coordinate."""
-    merge_map: dict[str, str] = {}
-
-    for mc in root.iter(f"{{{NS}}}mergeCell"):
-        ref = mc.get("ref", "")
-        m = _MERGE_REF_RE.match(ref)
-        if not m:
-            continue
-
-        start_col = _col_to_num(m.group(1))
-        start_row = int(m.group(2))
-        end_col = _col_to_num(m.group(3))
-        end_row = int(m.group(4))
-
-        origin = f"{start_col}:{start_row}"
-        for r in range(start_row, end_row + 1):
-            for c in range(start_col, end_col + 1):
-                merge_map[f"{c}:{r}"] = origin
-
-    return merge_map
-
-
 # ── Grid building ──
 
 
-def _build_grid(
-    root: etree._Element,
-    shared_strings: list[str],
-    merge_map: dict[str, str],
-) -> dict[int, dict[int, str]]:
-    """Build a {row: {col: value}} grid from sheet XML."""
+def _build_grid(data: SheetData) -> dict[int, dict[int, str]]:
+    """Build a {row: {col: value}} grid from pre-scanned SheetData."""
     grid: dict[int, dict[int, str]] = {}
-    raw_values: dict[str, str] = {}
 
-    for c in root.iter(f"{{{NS}}}c"):
-        ref = c.get("r", "")
-        m = _CELL_REF_RE.match(ref)
-        if not m:
-            continue
-
-        col = _col_to_num(m.group(1))
-        row = int(m.group(2))
-
-        value = _resolve_value(c, shared_strings)
-        if value and value.strip():
-            raw_values[f"{col}:{row}"] = value
-
-    # Apply merge map
-    all_coords = set(raw_values.keys()) | set(merge_map.keys())
+    # Apply merge map: expand origin values to all merged coordinates
+    all_coords = set(data.raw_values.keys()) | set(data.merge_map.keys())
     for coord in all_coords:
-        origin = merge_map.get(coord, coord)
-        value = raw_values.get(origin)
+        origin = data.merge_map.get(coord, coord)
+        value = data.raw_values.get(origin)
         if not value or not value.strip():
             continue
 
@@ -394,30 +352,6 @@ def _build_grid(
         grid.setdefault(row, {})[col] = value
 
     return grid
-
-
-def _resolve_value(c: etree._Element, shared_strings: list[str]) -> str | None:
-    cell_type = c.get("t", "")
-
-    v_el = c.find(f"{{{NS}}}v")
-    if v_el is None:
-        f_el = c.find(f"{{{NS}}}f")
-        return f_el.text if f_el is not None else None
-
-    raw = v_el.text
-    if raw is None:
-        return None
-
-    if cell_type == "s":
-        try:
-            idx = int(raw)
-            if 0 <= idx < len(shared_strings):
-                return shared_strings[idx]
-        except ValueError:
-            pass
-        return raw
-
-    return raw
 
 
 # ── Utilities ──
@@ -446,8 +380,3 @@ def _is_numeric(s: str | None) -> bool:
         return False
 
 
-def _col_to_num(letters: str) -> int:
-    result = 0
-    for ch in letters:
-        result = result * 26 + (ord(ch) - ord("A") + 1)
-    return result

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "xlsx2semantic"
-version = "0.1.1"
+version = "0.1.2"
 description = "Transform XLSX files into LLM-friendly semantic XML"
 readme = "README.md"
 license = "MIT"
