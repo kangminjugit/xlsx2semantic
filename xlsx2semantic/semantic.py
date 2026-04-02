@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 from xlsx2semantic.layout_hint import TableLayoutHint
 from xlsx2semantic.sheet_scanner import SheetData, scan_sheet
+from xlsx2semantic.structural_anchor import TableBoundary, detect_tables
 
 NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 
@@ -74,7 +75,7 @@ def transform(
             resolved = hint.resolve_defaults(max_row, max_col)
             return _build_with_hint(grid, all_rows, resolved)
         else:
-            return _build_auto_detect(grid, all_rows)
+            return _build_auto_detect(grid, all_rows, data.merge_map)
     except Exception as e:
         logger.warning("Failed to transform sheet to semantic XML: %s", e, exc_info=True)
         return f"<semantic-table><error>{e}</error></semantic-table>"
@@ -111,7 +112,7 @@ def _build_with_hint(
         header_end_col = hint.header_end_col
         first_data_row = hint.header_end_row + 1
     else:
-        auto = _auto_detect_headers(grid, all_rows, hint.title_rows)
+        auto = _hint_fallback_detect_headers(grid, all_rows, hint.title_rows)
         header_rows = auto[0]
         first_data_row = auto[1]
         header_start_col = -1
@@ -209,47 +210,140 @@ def _build_with_hint(
     return etree.tostring(root, pretty_print=True, xml_declaration=False, encoding="unicode")
 
 
-# ── Auto-detect transformation ──
+# ── Auto-detect transformation (structural-anchor based) ──
 
 
 def _build_auto_detect(
     grid: dict[int, dict[int, str]],
     all_rows: list[int],
+    merge_map: dict[str, str],
 ) -> str:
-    header_rows, first_data_row = _auto_detect_headers(grid, all_rows, frozenset())
+    """Detect table regions via structural anchors, then build semantic XML."""
+    tables = detect_tables(grid, merge_map)
 
-    all_cols: set[int] = set()
-    for row in grid.values():
-        all_cols.update(row.keys())
+    if not tables:
+        return "<semantic-table/>"
 
-    column_tags = _build_column_tags(grid, header_rows, sorted(all_cols))
+    if len(tables) == 1:
+        return _build_table_xml(grid, tables[0])
 
+    # Multiple tables → wrap in <sheet>
+    root = etree.Element("sheet")
+    for i, table in enumerate(tables):
+        table_str = _build_table_xml(grid, table)
+        table_el = etree.fromstring(table_str.encode("utf-8"))
+        table_el.set("index", str(i + 1))
+        root.append(table_el)
+
+    return etree.tostring(root, pretty_print=True, xml_declaration=False, encoding="unicode")
+
+
+def _build_table_xml(
+    grid: dict[int, dict[int, str]],
+    table: TableBoundary,
+) -> str:
+    """Generate ``<semantic-table>`` XML for a single detected table."""
     root = etree.Element("semantic-table")
 
-    # Schema
+    # 1. Title
+    if table.title_rows:
+        unique_parts: dict[str, None] = OrderedDict()
+        for tr in sorted(table.title_rows):
+            row = grid.get(tr)
+            if not row:
+                continue
+            for val in row.values():
+                if val and val.strip():
+                    unique_parts[val.strip()] = None
+        if unique_parts:
+            title_el = etree.SubElement(root, "title")
+            title_el.text = " ".join(unique_parts.keys())
+
+    # 2. Column tags from header rows
+    all_data_cols: set[int] = set()
+    for r in range(table.min_row, table.max_row + 1):
+        for c in grid.get(r, {}).keys():
+            if table.min_col <= c <= table.max_col:
+                all_data_cols.add(c)
+
+    meta_col = table.row_meta_col
+    column_tags: dict[int, str] = OrderedDict()
+
+    for col in sorted(all_data_cols):
+        if col == meta_col:
+            continue
+        parts: list[str] = []
+        for hr in table.header_rows:
+            row = grid.get(hr)
+            if row:
+                val = row.get(col)
+                if val and val.strip():
+                    cleaned = val.strip()
+                    if not parts or parts[-1].lower() != cleaned.lower():
+                        parts.append(cleaned)
+        if parts:
+            column_tags[col] = _to_tag_name("_".join(parts))
+
+    # If no headers detected, use positional tag names
+    if not column_tags and all_data_cols:
+        for col in sorted(all_data_cols):
+            if col == meta_col:
+                continue
+            column_tags[col] = f"col_{col}"
+
+    # 3. Row meta attribute name
+    meta_attr_name: str | None = None
+    if meta_col > 0:
+        meta_parts: list[str] = []
+        for hr in table.header_rows:
+            row = grid.get(hr)
+            if row:
+                val = row.get(meta_col)
+                if val and val.strip():
+                    cleaned = val.strip()
+                    if not meta_parts or meta_parts[-1].lower() != cleaned.lower():
+                        meta_parts.append(cleaned)
+        meta_attr_name = _to_tag_name("_".join(meta_parts)) if meta_parts else "label"
+
+    # 4. Schema
     schema_el = etree.SubElement(root, "schema")
+    if meta_col > 0 and meta_attr_name:
+        meta_el = etree.SubElement(schema_el, "row-key")
+        meta_el.set("index", str(meta_col))
+        meta_el.set("attribute", meta_attr_name)
     for col, tag in column_tags.items():
         col_el = etree.SubElement(schema_el, "column")
         col_el.set("index", str(col))
         col_el.set("tag", tag)
 
-    # Records
+    # 5. Records
     records_el = etree.SubElement(root, "records")
     record_count = 0
 
-    for row_idx in all_rows:
-        if row_idx < first_data_row:
+    skip_rows = set(table.title_rows) | set(table.header_rows) | set(table.section_rows)
+
+    for row_idx in range(table.min_row, table.max_row + 1):
+        if row_idx in skip_rows or row_idx < table.data_start_row:
             continue
         row_data = grid.get(row_idx)
         if not row_data:
             continue
 
-        has_tagged = any(col in column_tags for col in row_data)
+        has_tagged = any(
+            col in column_tags
+            for col in row_data
+            if table.min_col <= col <= table.max_col
+        )
         if not has_tagged:
             continue
 
         record_el = etree.SubElement(records_el, "record")
         record_el.set("row", str(row_idx))
+
+        if meta_col > 0 and meta_attr_name:
+            meta_value = row_data.get(meta_col)
+            if meta_value and meta_value.strip():
+                record_el.set(meta_attr_name, meta_value.strip())
 
         has_children = False
         for col, tag in column_tags.items():
@@ -269,15 +363,12 @@ def _build_auto_detect(
     return etree.tostring(root, pretty_print=True, xml_declaration=False, encoding="unicode")
 
 
-def _auto_detect_headers(
+def _hint_fallback_detect_headers(
     grid: dict[int, dict[int, str]],
     all_rows: list[int],
     skip_rows: frozenset[int],
 ) -> tuple[list[int], int]:
-    """Detect header rows by text/numeric ratio heuristic.
-
-    Returns (header_rows, first_data_row).
-    """
+    """Simple text/numeric ratio heuristic used when a hint lacks header_range."""
     header_rows: list[int] = []
     first_data_row = -1
 
