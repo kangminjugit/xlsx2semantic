@@ -7,6 +7,7 @@ header/title inference evidence-driven instead of rule-only.
 from __future__ import annotations
 
 import re
+import re
 from dataclasses import dataclass
 from functools import lru_cache
 from statistics import pstdev
@@ -766,6 +767,27 @@ def _content_rows(grid: dict[int, dict[int, str]], table: TableBoundary) -> list
     ]
 
 
+def _column_values(
+    grid: dict[int, dict[int, str]],
+    table: TableBoundary,
+    col_idx: int,
+) -> list[str]:
+    values: list[str] = []
+    for row_idx in range(table.min_row, table.max_row + 1):
+        value = grid.get(row_idx, {}).get(col_idx, "")
+        if value and value.strip():
+            values.append(value)
+    return values
+
+
+def _content_rows(grid: dict[int, dict[int, str]], table: TableBoundary) -> list[int]:
+    return [
+        row_idx
+        for row_idx in range(table.min_row, table.max_row + 1)
+        if grid.get(row_idx) and row_idx not in table.section_rows
+    ]
+
+
 def _coverage_ratio(
     grid: dict[int, dict[int, str]],
     table: TableBoundary,
@@ -779,6 +801,11 @@ def _topness(row_idx: int, content_rows: list[int]) -> float:
         return 1.0
     position = content_rows.index(row_idx)
     return 1.0 - (position / (len(content_rows) - 1))
+
+
+def _leftness(col_idx: int, table: TableBoundary) -> float:
+    width = max(1, table.max_col - table.min_col)
+    return 1.0 - ((col_idx - table.min_col) / width)
 
 
 def _leftness(col_idx: int, table: TableBoundary) -> float:
