@@ -33,7 +33,11 @@ from lxml import etree
 logger = logging.getLogger(__name__)
 
 from xlsx2semantic.layout_hint import TableLayoutHint
-from xlsx2semantic.semantic_scorer import SemanticDecision, decide_semantics
+from xlsx2semantic.semantic_scorer import (
+    SemanticDecision,
+    build_cell_role_inferer,
+    decide_semantics,
+)
 from xlsx2semantic.sheet_scanner import SheetData, scan_sheet
 from xlsx2semantic.structural_anchor import TableBoundary, detect_tables
 
@@ -45,6 +49,7 @@ def transform(
     shared_strings: list[str],
     hint: TableLayoutHint | None = None,
     include_trace: bool = False,
+    include_cell_roles: bool = False,
 ) -> str:
     """Transform sheet XML into semantic table XML.
 
@@ -75,10 +80,24 @@ def transform(
                 default=1,
             )
             resolved = hint.resolve_defaults(max_row, max_col)
-            return _build_with_hint(grid, all_rows, resolved, include_trace=include_trace)
+            return _build_with_hint(
+                grid,
+                all_rows,
+                resolved,
+                data.merge_map,
+                include_trace=include_trace,
+                include_cell_roles=include_cell_roles,
+            )
         else:
             count = hint.header_row_count if hint is not None else 1
-            return _build_auto_detect(grid, all_rows, data.merge_map, count, include_trace=include_trace)
+            return _build_auto_detect(
+                grid,
+                all_rows,
+                data.merge_map,
+                count,
+                include_trace=include_trace,
+                include_cell_roles=include_cell_roles,
+            )
     except Exception as e:
         logger.warning("Failed to transform sheet to semantic XML: %s", e, exc_info=True)
         return f"<semantic-table><error>{e}</error></semantic-table>"
@@ -91,7 +110,9 @@ def _build_with_hint(
     grid: dict[int, dict[int, str]],
     all_rows: list[int],
     hint: TableLayoutHint,
+    merge_map: dict[str, str],
     include_trace: bool = False,
+    include_cell_roles: bool = False,
 ) -> str:
     root = etree.Element("semantic-table")
 
@@ -128,6 +149,17 @@ def _build_with_hint(
         all_data_cols.update(row.keys())
 
     meta_cols: set[int] = set(hint.row_meta_col_nums) if hint.has_row_meta_col else set()
+    table = TableBoundary(
+        min_row=min(all_rows),
+        max_row=max(all_rows),
+        min_col=min(all_data_cols) if all_data_cols else 1,
+        max_col=max(all_data_cols) if all_data_cols else 1,
+        title_rows=hint.title_rows,
+        header_rows=tuple(header_rows),
+        data_start_row=first_data_row,
+        section_rows=frozenset(),
+    )
+    role_inferer = build_cell_role_inferer(grid, table, merge_map) if include_cell_roles else None
 
     eligible_cols = [
         col for col in sorted(all_data_cols)
@@ -154,10 +186,14 @@ def _build_with_hint(
         meta_el = etree.SubElement(schema_el, "row-key")
         meta_el.set("index", str(mc))
         meta_el.set("attribute", attr_name)
+        if role_inferer is not None:
+            meta_el.set("role", _infer_column_role(grid, table, mc, role_inferer, preferred="stub"))
     for col, tag in column_tags.items():
         col_el = etree.SubElement(schema_el, "column")
         col_el.set("index", str(col))
         col_el.set("tag", tag)
+        if role_inferer is not None:
+            col_el.set("role", _infer_column_role(grid, table, col, role_inferer))
 
     # 5. Description rows (full-width merged cells in the data area)
     skip_rows = set(hint.title_rows) | set(header_rows)
@@ -208,6 +244,8 @@ def _build_with_hint(
             value = row_data.get(col)
             if value and value.strip():
                 field_el = etree.SubElement(record_el, tag)
+                if role_inferer is not None:
+                    field_el.set("role", role_inferer.infer(row_idx, col))
                 field_el.text = _normalize_cell_value(value)
                 has_children = True
 
@@ -233,6 +271,7 @@ def _build_auto_detect(
     merge_map: dict[str, str],
     header_row_count: int = 1,
     include_trace: bool = False,
+    include_cell_roles: bool = False,
 ) -> str:
     """Detect table regions via structural anchors, then build semantic XML."""
     scored_tables = []
@@ -264,12 +303,28 @@ def _build_auto_detect(
 
     if len(non_empty_with_context) == 1:
         table, decision, inh_title, inh_descs = non_empty_with_context[0]
-        return _build_table_xml(grid, table, inh_title, inh_descs, decision if include_trace else None)
+        return _build_table_xml(
+            grid,
+            table,
+            merge_map,
+            inh_title,
+            inh_descs,
+            decision if include_trace else None,
+            include_cell_roles=include_cell_roles,
+        )
 
     # Multiple tables → wrap in <sheet>
     root = etree.Element("sheet")
     for index, (table, decision, inh_title, inh_descs) in enumerate(non_empty_with_context, start=1):
-        table_str = _build_table_xml(grid, table, inh_title, inh_descs, decision if include_trace else None)
+        table_str = _build_table_xml(
+            grid,
+            table,
+            merge_map,
+            inh_title,
+            inh_descs,
+            decision if include_trace else None,
+            include_cell_roles=include_cell_roles,
+        )
         table_el = etree.fromstring(table_str.encode("utf-8"))
         table_el.set("index", str(index))
         root.append(table_el)
@@ -280,9 +335,11 @@ def _build_auto_detect(
 def _build_table_xml(
     grid: dict[int, dict[int, str]],
     table: TableBoundary,
+    merge_map: dict[str, str],
     inherited_title: str | None = None,
     inherited_descriptions: list[str] | None = None,
     decision: SemanticDecision | None = None,
+    include_cell_roles: bool = False,
 ) -> str:
     """Generate ``<semantic-table>`` XML for a single detected table."""
     root = etree.Element("semantic-table")
@@ -333,6 +390,7 @@ def _build_table_xml(
     if not column_tags and all_data_cols:
         for col in sorted(all_data_cols):
             column_tags[col] = f"col_{col}"
+    role_inferer = build_cell_role_inferer(grid, table, merge_map) if include_cell_roles else None
 
     # 3. Schema
     schema_el = etree.SubElement(root, "schema")
@@ -340,6 +398,8 @@ def _build_table_xml(
         col_el = etree.SubElement(schema_el, "column")
         col_el.set("index", str(col))
         col_el.set("tag", tag)
+        if role_inferer is not None:
+            col_el.set("role", _infer_column_role(grid, table, col, role_inferer))
 
     # 4. Description rows (full-width merged cells in the data area)
     skip_rows = set(table.title_rows) | set(table.header_rows) | set(table.section_rows)
@@ -400,6 +460,8 @@ def _build_table_xml(
             value = row_data.get(col)
             if value and value.strip():
                 field_el = etree.SubElement(record_el, tag)
+                if role_inferer is not None:
+                    field_el.set("role", role_inferer.infer(row_idx, col))
                 field_el.text = _normalize_cell_value(value)
                 has_children = True
 
@@ -595,6 +657,30 @@ def _build_grid(data: SheetData) -> dict[int, dict[int, str]]:
         grid.setdefault(row, {})[col] = value
 
     return grid
+
+
+def _infer_column_role(
+    grid: dict[int, dict[int, str]],
+    table: TableBoundary,
+    col_idx: int,
+    role_inferer,
+    preferred: str | None = None,
+) -> str:
+    """Infer a representative semantic role for one column from its data cells."""
+    roles: list[str] = []
+    for row_idx in range(table.data_start_row, table.max_row + 1):
+        value = (grid.get(row_idx, {}).get(col_idx) or "").strip()
+        if not value:
+            continue
+        role = role_inferer.infer(row_idx, col_idx)
+        if role not in {"empty", "context", "header", "title", "section"}:
+            roles.append(role)
+
+    if preferred and preferred in roles:
+        return preferred
+    if roles:
+        return max(sorted(set(roles)), key=roles.count)
+    return preferred or "attribute"
 
 
 # ── Utilities ──

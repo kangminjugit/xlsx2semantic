@@ -6,7 +6,10 @@ header/title inference evidence-driven instead of rule-only.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from functools import lru_cache
+from statistics import pstdev
 
 from xlsx2semantic.structural_anchor import TableBoundary
 
@@ -40,6 +43,347 @@ class RowTrace:
     title_score: float
     header_score: float
     data_score: float
+
+
+@dataclass(frozen=True)
+class CellFeatures:
+    """Feature set for a single cell inside a table boundary."""
+
+    is_text: bool
+    is_numeric: bool
+    is_empty: bool
+    text_length: int
+    contains_unit_keyword: bool
+    contains_parentheses: bool
+    contains_colon: bool
+    is_symbolic: bool
+    is_date_like: bool
+    is_near_top: float
+    is_near_left: float
+    is_merged: bool
+    merge_span_cols: int
+    merge_span_rows: int
+
+
+@dataclass(frozen=True)
+class RowFeatures:
+    """Feature set summarizing one row in a table boundary."""
+
+    row_coverage_ratio: float
+    row_text_ratio: float
+    row_numeric_ratio: float
+    row_unique_ratio: float
+    row_schema_similarity: float
+    row_pattern_repeat_score: float
+    row_has_single_value: bool
+    row_value_variance: float
+    row_symbolic_ratio: float
+
+
+@dataclass(frozen=True)
+class ColumnFeatures:
+    """Feature set summarizing one column in a table boundary."""
+
+    col_text_ratio: float
+    col_numeric_ratio: float
+    col_unique_ratio: float
+    col_type_consistency: float
+    col_category_repetition: float
+    col_is_key_candidate: bool
+    col_leftness_score: float
+
+
+_INFERER_CACHE: dict[tuple[int, TableBoundary, int, int, int], "CellRoleInferer"] = {}
+
+
+class CellRoleInferer:
+    """Cache-backed cell role inferer for repeated lookups within one table."""
+
+    def __init__(
+        self,
+        grid: dict[int, dict[int, str]],
+        table: TableBoundary,
+        merge_map: dict[str, str] | None = None,
+    ) -> None:
+        self._grid = grid
+        self._table = table
+        self._merge_map = merge_map or {}
+        self._content_rows = _content_rows(grid, table)
+        self._row_patterns = {
+            row_idx: _row_schema_pattern(grid, table, row_idx)
+            for row_idx in self._content_rows
+        }
+        self._merge_spans = _build_merge_span_map(self._merge_map)
+        self._row_features: dict[int, RowFeatures] = {}
+        self._col_features: dict[int, ColumnFeatures] = {}
+        self._roles: dict[tuple[int, int], str] = {}
+
+    def infer(self, row_idx: int, col_idx: int) -> str:
+        key = (row_idx, col_idx)
+        if key in self._roles:
+            return self._roles[key]
+
+        cell_feat = self._extract_cell_features(row_idx, col_idx)
+        row_feat = self._row_features.setdefault(row_idx, self._extract_row_features(row_idx))
+        col_feat = self._col_features.setdefault(col_idx, self._extract_column_features(col_idx))
+        role = classify_cell_role(
+            cell_feat,
+            row_feat,
+            col_feat,
+            table=self._table,
+            row_idx=row_idx,
+            col_idx=col_idx,
+        )
+        self._roles[key] = role
+        return role
+
+    def _extract_cell_features(self, row_idx: int, col_idx: int) -> CellFeatures:
+        raw_value = self._grid.get(row_idx, {}).get(col_idx, "")
+        value = (raw_value or "").strip()
+        is_merged, span_cols, span_rows = self._merge_spans.get((row_idx, col_idx), (False, 1, 1))
+        return CellFeatures(
+            is_text=bool(value) and not _is_numeric(value),
+            is_numeric=_is_numeric(value),
+            is_empty=not bool(value),
+            text_length=len(value),
+            contains_unit_keyword=_contains_unit_keyword(value),
+            contains_parentheses=("(" in value) or (")" in value),
+            contains_colon=":" in value,
+            is_symbolic=_is_symbolic(value),
+            is_date_like=_is_date_like(value),
+            is_near_top=_topness(row_idx, self._content_rows),
+            is_near_left=_leftness(col_idx, self._table),
+            is_merged=is_merged,
+            merge_span_cols=span_cols,
+            merge_span_rows=span_rows,
+        )
+
+    def _extract_row_features(self, row_idx: int) -> RowFeatures:
+        values = _row_values(self._grid, self._table, row_idx)
+        current_pattern = self._row_patterns.get(row_idx, ())
+        comparable = tuple(
+            pattern
+            for other_row, pattern in self._row_patterns.items()
+            if other_row != row_idx
+        )
+        return _build_row_features_cached(
+            tuple(values),
+            current_pattern,
+            comparable,
+            _coverage_ratio(self._grid, self._table, row_idx),
+        )
+
+    def _extract_column_features(self, col_idx: int) -> ColumnFeatures:
+        values = _column_values(self._grid, self._table, col_idx)
+        return _build_column_features_cached(tuple(values), _leftness(col_idx, self._table))
+
+
+def build_cell_role_inferer(
+    grid: dict[int, dict[int, str]],
+    table: TableBoundary,
+    merge_map: dict[str, str] | None = None,
+) -> CellRoleInferer:
+    """Create a cache-backed inferer for repeated cell-role lookups."""
+    active_merge_map = merge_map or {}
+    cache_key = (
+        id(grid),
+        table,
+        id(active_merge_map),
+        len(grid),
+        len(active_merge_map),
+    )
+    inferer = _INFERER_CACHE.get(cache_key)
+    if inferer is None:
+        inferer = CellRoleInferer(grid, table, active_merge_map)
+        _INFERER_CACHE[cache_key] = inferer
+    return inferer
+
+
+def infer_cell_role(
+    grid: dict[int, dict[int, str]],
+    table: TableBoundary,
+    row_idx: int,
+    col_idx: int,
+    merge_map: dict[str, str] | None = None,
+) -> str:
+    """Infer a semantic role for one cell by combining cell/row/column features."""
+    return build_cell_role_inferer(grid, table, merge_map).infer(row_idx, col_idx)
+
+
+def classify_cell_role(
+    cell_feat: CellFeatures,
+    row_feat: RowFeatures,
+    col_feat: ColumnFeatures,
+    *,
+    table: TableBoundary,
+    row_idx: int,
+    col_idx: int,
+) -> str:
+    """Return a coarse semantic role from fused cell/row/column features."""
+    return _classify_cell_role_cached(
+        cell_feat,
+        row_feat,
+        col_feat,
+        table,
+        row_idx,
+        col_idx,
+    )
+
+
+@lru_cache(maxsize=32768)
+def _classify_cell_role_cached(
+    cell_feat: CellFeatures,
+    row_feat: RowFeatures,
+    col_feat: ColumnFeatures,
+    table: TableBoundary,
+    row_idx: int,
+    col_idx: int,
+) -> str:
+    """Hash-based cache for cell-role classification over immutable features."""
+    if cell_feat.is_empty:
+        return "empty"
+    if row_idx in table.title_rows:
+        return "title"
+    if row_idx in table.header_rows:
+        return "header"
+    if row_idx in table.section_rows:
+        return "section"
+    if row_idx < table.data_start_row:
+        return "context"
+
+    if cell_feat.is_merged and cell_feat.merge_span_cols >= max(2, table.max_col - table.min_col):
+        return "context"
+    if cell_feat.is_symbolic:
+        return "attribute"
+
+    row_meta_score = _row_meta_score(cell_feat, col_feat, table)
+
+    if cell_feat.is_numeric:
+        if col_feat.col_numeric_ratio >= 0.5 or row_feat.row_numeric_ratio >= 0.5:
+            return "measure"
+        return "attribute"
+
+    if cell_feat.is_date_like:
+        if col_feat.col_is_key_candidate or col_feat.col_unique_ratio >= 0.5:
+            return "dimension"
+        return "attribute"
+
+    if cell_feat.is_text and row_meta_score >= 0.60:
+        return "stub"
+
+    if cell_feat.is_text and col_feat.col_is_key_candidate:
+        return "dimension"
+
+    if (
+        cell_feat.is_text
+        and col_feat.col_text_ratio >= 0.7
+        and col_feat.col_unique_ratio >= 0.5
+        and (row_feat.row_numeric_ratio >= 0.3 or col_feat.col_leftness_score >= 0.5)
+    ):
+        return "dimension"
+
+    if (
+        cell_feat.contains_unit_keyword
+        or cell_feat.contains_parentheses
+        or cell_feat.contains_colon
+        or row_feat.row_text_ratio >= 0.7
+    ):
+        return "attribute"
+
+    return "dimension" if cell_feat.is_text else "attribute"
+
+
+def _row_meta_score(
+    cell_feat: CellFeatures,
+    col_feat: ColumnFeatures,
+    table: TableBoundary,
+) -> float:
+    """Score how likely a text cell/column pair is to be a row-meta anchor."""
+    merge_anchor_score = _merge_anchor_score(cell_feat, table)
+    return (
+        0.30 * col_feat.col_unique_ratio
+        + 0.20 * col_feat.col_text_ratio
+        + 0.15 * (1.0 - col_feat.col_numeric_ratio)
+        + 0.10 * col_feat.col_type_consistency
+        + 0.10 * col_feat.col_leftness_score
+        + 0.15 * merge_anchor_score
+    )
+
+
+def _merge_anchor_score(cell_feat: CellFeatures, table: TableBoundary) -> float:
+    """Return merge evidence strength for row-meta detection."""
+    max_col_span = max(1, table.max_col - table.min_col + 1)
+    max_row_span = max(1, table.max_row - table.min_row + 1)
+    normalized_span_rows = min(1.0, cell_feat.merge_span_rows / max_row_span)
+    normalized_span_cols = min(1.0, cell_feat.merge_span_cols / max_col_span)
+    return (
+        0.50 * float(cell_feat.is_merged)
+        + 0.30 * normalized_span_rows
+        + 0.20 * normalized_span_cols
+    )
+
+
+@lru_cache(maxsize=32768)
+def _build_row_features_cached(
+    values: tuple[str, ...],
+    current_pattern: tuple[str, ...],
+    comparable_patterns: tuple[tuple[str, ...], ...],
+    coverage_ratio: float,
+) -> RowFeatures:
+    """Hash-based cache for row-feature construction."""
+    comparable = list(comparable_patterns)
+    schema_similarity = _pattern_similarity(current_pattern, comparable)
+    repeat_score = 0.0
+    if comparable:
+        repeat_score = sum(1 for pattern in comparable if pattern == current_pattern) / len(comparable)
+
+    non_empty = [value for value in values if value.strip()]
+    normalized = [value.strip().lower() for value in non_empty]
+    text_lengths = [len(value) for value in non_empty]
+    value_variance = 0.0 if len(text_lengths) <= 1 else min(1.0, pstdev(text_lengths) / 10.0)
+
+    return RowFeatures(
+        row_coverage_ratio=coverage_ratio,
+        row_text_ratio=_text_ratio(list(values)),
+        row_numeric_ratio=_numeric_ratio(list(values)),
+        row_unique_ratio=len(set(normalized)) / max(1, len(normalized)),
+        row_schema_similarity=schema_similarity,
+        row_pattern_repeat_score=repeat_score,
+        row_has_single_value=len(set(normalized)) == 1 if normalized else False,
+        row_value_variance=value_variance,
+        row_symbolic_ratio=sum(1 for value in values if _is_symbolic(value)) / max(1, len(values)),
+    )
+
+
+@lru_cache(maxsize=32768)
+def _build_column_features_cached(
+    values: tuple[str, ...],
+    leftness: float,
+) -> ColumnFeatures:
+    """Hash-based cache for column-feature construction."""
+    non_empty = [value for value in values if value.strip()]
+    normalized = [value.strip().lower() for value in non_empty]
+    text_ratio = _text_ratio(non_empty)
+    numeric_ratio = _numeric_ratio(non_empty)
+    symbolic_ratio = sum(1 for value in non_empty if _is_symbolic(value)) / max(1, len(non_empty))
+    dominant_ratio = max(text_ratio, numeric_ratio, symbolic_ratio) if non_empty else 0.0
+    unique_ratio = len(set(normalized)) / max(1, len(normalized))
+    key_candidate_score = (
+        0.45 * unique_ratio
+        + 0.35 * text_ratio
+        + 0.20 * (1.0 - numeric_ratio)
+    )
+    is_key = bool(non_empty) and key_candidate_score >= 0.65
+
+    return ColumnFeatures(
+        col_text_ratio=text_ratio,
+        col_numeric_ratio=numeric_ratio,
+        col_unique_ratio=unique_ratio,
+        col_type_consistency=dominant_ratio,
+        col_category_repetition=1.0 - unique_ratio,
+        col_is_key_candidate=is_key,
+        col_leftness_score=leftness,
+    )
 
 
 def rescore_table_boundary(
@@ -145,6 +489,64 @@ def decide_semantics(
         data_start_row=data_start,
         confidence=0.2,
     )
+
+
+def extract_cell_features(
+    grid: dict[int, dict[int, str]],
+    table: TableBoundary,
+    row_idx: int,
+    col_idx: int,
+    merge_map: dict[str, str] | None = None,
+) -> CellFeatures:
+    """Extract cell-level features used by semantic heuristics."""
+    raw_value = grid.get(row_idx, {}).get(col_idx, "")
+    value = (raw_value or "").strip()
+    merge_info = _resolve_merge_info(row_idx, col_idx, merge_map or {})
+    return CellFeatures(
+        is_text=bool(value) and not _is_numeric(value),
+        is_numeric=_is_numeric(value),
+        is_empty=not bool(value),
+        text_length=len(value),
+        contains_unit_keyword=_contains_unit_keyword(value),
+        contains_parentheses=("(" in value) or (")" in value),
+        contains_colon=":" in value,
+        is_symbolic=_is_symbolic(value),
+        is_date_like=_is_date_like(value),
+        is_near_top=_topness(row_idx, _content_rows(grid, table)),
+        is_near_left=_leftness(col_idx, table),
+        is_merged=merge_info[0],
+        merge_span_cols=merge_info[1],
+        merge_span_rows=merge_info[2],
+    )
+
+
+def extract_row_features(
+    grid: dict[int, dict[int, str]],
+    table: TableBoundary,
+    row_idx: int,
+) -> RowFeatures:
+    """Extract row-level structural and semantic features."""
+    values = _row_values(grid, table, row_idx)
+    content_rows = _content_rows(grid, table)
+    row_patterns = {r: _row_schema_pattern(grid, table, r) for r in content_rows}
+    current_pattern = row_patterns.get(row_idx, ())
+    comparable = tuple(p for r, p in row_patterns.items() if r != row_idx)
+    return _build_row_features_cached(
+        tuple(values),
+        current_pattern,
+        comparable,
+        _coverage_ratio(grid, table, row_idx),
+    )
+
+
+def extract_column_features(
+    grid: dict[int, dict[int, str]],
+    table: TableBoundary,
+    col_idx: int,
+) -> ColumnFeatures:
+    """Extract column-level features for key-column and type inference."""
+    values = _column_values(grid, table, col_idx)
+    return _build_column_features_cached(tuple(values), _leftness(col_idx, table))
 
 
 def _title_score(
@@ -343,6 +745,27 @@ def _row_values(
     ]
 
 
+def _column_values(
+    grid: dict[int, dict[int, str]],
+    table: TableBoundary,
+    col_idx: int,
+) -> list[str]:
+    values: list[str] = []
+    for row_idx in range(table.min_row, table.max_row + 1):
+        value = grid.get(row_idx, {}).get(col_idx, "")
+        if value and value.strip():
+            values.append(value)
+    return values
+
+
+def _content_rows(grid: dict[int, dict[int, str]], table: TableBoundary) -> list[int]:
+    return [
+        row_idx
+        for row_idx in range(table.min_row, table.max_row + 1)
+        if grid.get(row_idx) and row_idx not in table.section_rows
+    ]
+
+
 def _coverage_ratio(
     grid: dict[int, dict[int, str]],
     table: TableBoundary,
@@ -356,6 +779,11 @@ def _topness(row_idx: int, content_rows: list[int]) -> float:
         return 1.0
     position = content_rows.index(row_idx)
     return 1.0 - (position / (len(content_rows) - 1))
+
+
+def _leftness(col_idx: int, table: TableBoundary) -> float:
+    width = max(1, table.max_col - table.min_col)
+    return 1.0 - ((col_idx - table.min_col) / width)
 
 
 def _text_ratio(values: list[str]) -> float:
@@ -374,3 +802,112 @@ def _is_numeric(text: str | None) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _is_symbolic(text: str | None) -> bool:
+    if not text:
+        return False
+    return text.strip().lower() in {"-", "n/a", "na", "none", "null", "nan", "tbd"}
+
+
+def _is_date_like(text: str | None) -> bool:
+    if not text:
+        return False
+    normalized = text.strip()
+    patterns = (
+        r"^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}$",
+        r"^\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}$",
+        r"^\d{4}년\s*\d{1,2}월(\s*\d{1,2}일)?$",
+    )
+    return any(re.match(pattern, normalized) for pattern in patterns)
+
+
+def _contains_unit_keyword(text: str) -> bool:
+    if not text:
+        return False
+    keywords = ("단위", "억원", "백만원", "천원", "kg", "km", "m²", "%")
+    lowered = text.lower()
+    return any(keyword.lower() in lowered for keyword in keywords)
+
+
+def _row_schema_pattern(
+    grid: dict[int, dict[int, str]],
+    table: TableBoundary,
+    row_idx: int,
+) -> tuple[str, ...]:
+    row = grid.get(row_idx, {})
+    pattern: list[str] = []
+    for col_idx in range(table.min_col, table.max_col + 1):
+        value = (row.get(col_idx, "") or "").strip()
+        if not value:
+            pattern.append("E")
+        elif _is_symbolic(value):
+            pattern.append("S")
+        elif _is_numeric(value):
+            pattern.append("N")
+        else:
+            pattern.append("T")
+    return tuple(pattern)
+
+
+def _pattern_similarity(current: tuple[str, ...], candidates: list[tuple[str, ...]]) -> float:
+    if not current or not candidates:
+        return 0.0
+    scores: list[float] = []
+    for other in candidates:
+        if len(other) != len(current):
+            continue
+        matched = sum(1 for c1, c2 in zip(current, other) if c1 == c2)
+        scores.append(matched / len(current))
+    return sum(scores) / len(scores) if scores else 0.0
+
+
+def _resolve_merge_info(row_idx: int, col_idx: int, merge_map: dict[str, str]) -> tuple[bool, int, int]:
+    """Return (is_merged, span_cols, span_rows) for one cell."""
+    if not merge_map:
+        return False, 1, 1
+
+    coord = f"{col_idx}:{row_idx}"
+    origin = merge_map.get(coord)
+    if not origin:
+        return False, 1, 1
+
+    merged_cells = [key for key, mapped_origin in merge_map.items() if mapped_origin == origin]
+    if len(merged_cells) <= 1:
+        return False, 1, 1
+
+    merged_cols = [int(cell.split(":")[0]) for cell in merged_cells]
+    merged_rows = [int(cell.split(":")[1]) for cell in merged_cells]
+    span_cols = (max(merged_cols) - min(merged_cols) + 1) if merged_cols else 1
+    span_rows = (max(merged_rows) - min(merged_rows) + 1) if merged_rows else 1
+    return True, span_cols, span_rows
+
+
+def _build_merge_span_map(
+    merge_map: dict[str, str],
+) -> dict[tuple[int, int], tuple[bool, int, int]]:
+    """Precompute merge spans for constant-time cell lookups."""
+    if not merge_map:
+        return {}
+
+    by_origin: dict[str, list[str]] = {}
+    for coord, origin in merge_map.items():
+        by_origin.setdefault(origin, []).append(coord)
+
+    result: dict[tuple[int, int], tuple[bool, int, int]] = {}
+    for coords in by_origin.values():
+        if len(coords) <= 1:
+            coord = coords[0]
+            col, row = (int(part) for part in coord.split(":"))
+            result[(row, col)] = (False, 1, 1)
+            continue
+
+        cols = [int(coord.split(":")[0]) for coord in coords]
+        rows = [int(coord.split(":")[1]) for coord in coords]
+        span_cols = max(cols) - min(cols) + 1
+        span_rows = max(rows) - min(rows) + 1
+        for coord in coords:
+            col, row = (int(part) for part in coord.split(":"))
+            result[(row, col)] = (True, span_cols, span_rows)
+
+    return result
