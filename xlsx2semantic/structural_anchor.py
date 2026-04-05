@@ -38,7 +38,6 @@ class TableBoundary:
     title_rows: frozenset[int] = frozenset()
     header_rows: tuple[int, ...] = ()
     data_start_row: int = -1
-    row_meta_col: int = -1
     section_rows: frozenset[int] = frozenset()
 
 
@@ -48,6 +47,7 @@ class TableBoundary:
 def detect_tables(
     grid: dict[int, dict[int, str]],
     merge_map: dict[str, str],
+    header_row_count: int = 1,
 ) -> list[TableBoundary]:
     """Detect all table regions in a sheet grid.
 
@@ -89,7 +89,7 @@ def detect_tables(
             continue
 
         sub_merge = _extract_sub_merge(merge_map, actual_rows, min_col, max_col)
-        boundary = _analyze_region(sub_grid, sub_merge, actual_rows, min_col, max_col)
+        boundary = _analyze_region(sub_grid, sub_merge, actual_rows, min_col, max_col, header_row_count)
         if boundary is not None:
             tables.append(boundary)
 
@@ -188,6 +188,7 @@ def _analyze_region(
     rows: list[int],
     min_col: int,
     max_col: int,
+    header_row_count: int = 1,
 ) -> TableBoundary | None:
     if not sub_grid or not rows:
         return None
@@ -203,15 +204,20 @@ def _analyze_region(
     # Heterogeneity-based header detection (skip merge-detected title rows)
     skip = merge_title_rows
     het_title, header_rows, data_start = _detect_headers_by_heterogeneity(
-        sub_grid, rows, skip,
+        sub_grid, rows, skip, header_row_count,
     )
+
+    # Extend header block downward: rows whose cells are vertically merged
+    # from a header-origin cell are still part of the header, not data.
+    if sub_merge and header_rows:
+        header_rows, data_start = _extend_headers_via_merges(
+            header_rows, data_start, rows, sub_merge,
+        )
 
     title_rows = merge_title_rows | het_title
     section_rows: frozenset[int] = (
         merge_result.section_rows if merge_result else frozenset()
     )
-
-    row_meta = _detect_row_meta_col(sub_grid, header_rows, data_start, min_col, max_col)
 
     return TableBoundary(
         min_row=rows[0],
@@ -221,24 +227,30 @@ def _analyze_region(
         title_rows=title_rows,
         header_rows=header_rows,
         data_start_row=data_start,
-        row_meta_col=row_meta,
         section_rows=section_rows,
     )
 
 
-# ── Heterogeneity-based header detection ──
+# ── Header detection ──
 
 
 def _detect_headers_by_heterogeneity(
     grid: dict[int, dict[int, str]],
     all_rows: list[int],
     skip_rows: frozenset[int] = frozenset(),
+    header_row_count: int = 1,
 ) -> tuple[frozenset[int], tuple[int, ...], int]:
-    """Return ``(title_rows, header_rows, data_start_row)``."""
+    """Return ``(title_rows, header_rows, data_start_row)``.
+
+    Title rows are single-value rows at the very top (before any header).
+    The next ``header_row_count`` non-empty rows become the header rows.
+    Everything after that is data.
+    """
     if not all_rows:
         return frozenset(), (), -1
 
-    header_candidates: list[int] = []
+    title_rows: set[int] = set()
+    header_rows: list[int] = []
     data_start = -1
 
     for row_idx in all_rows:
@@ -249,107 +261,66 @@ def _detect_headers_by_heterogeneity(
         if not row_data:
             continue
 
-        text_count, num_count = _text_num_counts(row_data)
-        total = text_count + num_count
-        if total == 0:
-            continue
+        if not header_rows:
+            # Before collecting any header, single-value rows are titles
+            unique_vals = {v.strip() for v in row_data.values() if v and v.strip()}
+            if len(unique_vals) <= 1:
+                title_rows.add(row_idx)
+                continue
 
-        num_ratio = num_count / total
+        header_rows.append(row_idx)
 
-        # Row with enough cells and ≥50 % numeric → first data row
-        if total >= 2 and num_ratio >= 0.5:
-            data_start = row_idx
+        if len(header_rows) >= header_row_count:
+            remaining = [
+                r for r in all_rows
+                if r > row_idx and r not in skip_rows and grid.get(r)
+            ]
+            data_start = remaining[0] if remaining else row_idx + 1
             break
 
-        header_candidates.append(row_idx)
-
     if data_start == -1:
-        # No clear numeric data found — treat everything as one block
-        if len(header_candidates) <= 1:
-            # Probably all-text table; first row is data
-            data_start = all_rows[0]
-            header_candidates = []
-        else:
-            data_start = all_rows[-1] + 1
+        data_start = all_rows[-1] + 1
 
-    # Separate titles from headers:
-    # Title = single-value row at the very top before multi-cell header rows.
-    title_rows: set[int] = set()
-    remaining: list[int] = []
-    for hr in header_candidates:
-        row_data = grid.get(hr, {})
-        unique_vals = set(v.strip() for v in row_data.values() if v and v.strip())
-        if len(unique_vals) <= 1 and not remaining:
-            title_rows.add(hr)
-        else:
-            remaining.append(hr)
-
-    return frozenset(title_rows), tuple(remaining), data_start
+    return frozenset(title_rows), tuple(header_rows), data_start
 
 
-def _text_num_counts(row_data: dict[int, str]) -> tuple[int, int]:
-    text = num = 0
-    for val in row_data.values():
-        if not val or not val.strip():
-            continue
-        if _is_numeric(val.strip()):
-            num += 1
-        else:
-            text += 1
-    return text, num
-
-
-# ── Row-meta column detection ──
-
-
-def _detect_row_meta_col(
-    grid: dict[int, dict[int, str]],
+def _extend_headers_via_merges(
     header_rows: tuple[int, ...],
     data_start: int,
-    min_col: int,
-    max_col: int,
-) -> int:
-    """Find the leftmost mostly-text column in data rows (= row key)."""
-    if data_start < 0:
-        return -1
+    all_rows: list[int],
+    sub_merge: dict[str, str],
+) -> tuple[tuple[int, ...], int]:
+    """Extend header_rows to include rows covered by vertical merges from header cells.
 
-    header_set = set(header_rows)
-    data_rows = [
-        d for r, d in grid.items() if r >= data_start and r not in header_set
-    ]
-    if not data_rows:
-        return -1
+    When a header cell (e.g. "대여소번호" at row 1) is vertically merged down
+    to rows 2, 3, 4, those rows should still be treated as header rows, not data.
+    """
+    # Build a set of rows that are origins of merges within the current header block
+    header_row_set = set(header_rows)
 
-    col_text_ratio: dict[int, float] = {}
-    for col in range(min_col, max_col + 1):
-        text_n = total_n = 0
-        for rd in data_rows:
-            val = rd.get(col)
-            if val and val.strip():
-                total_n += 1
-                if not _is_numeric(val.strip()):
-                    text_n += 1
-        if total_n > 0:
-            col_text_ratio[col] = text_n / total_n
+    # Build a lookup: destination_row → {origin_rows}
+    dest_to_origins: dict[int, set[int]] = {}
+    for coord, origin in sub_merge.items():
+        dest_row = int(coord.split(":")[1])
+        origin_row = int(origin.split(":")[1])
+        if dest_row != origin_row:  # skip self-references
+            dest_to_origins.setdefault(dest_row, set()).add(origin_row)
 
-    if not col_text_ratio:
-        return -1
+    # Greedily extend: if the candidate data_start row has cells merged FROM
+    # a header row, absorb it into the header block and advance data_start.
+    extended = list(header_rows)
+    remaining_rows = [r for r in all_rows if r >= data_start]
 
-    text_cols = [c for c, r in col_text_ratio.items() if r > 0.8]
-    num_cols = [c for c, r in col_text_ratio.items() if r < 0.3]
+    for candidate in remaining_rows:
+        origins = dest_to_origins.get(candidate, set())
+        if origins & header_row_set:
+            # At least one cell in this row originates from a header cell
+            extended.append(candidate)
+            header_row_set.add(candidate)
+        else:
+            data_start = candidate
+            break
+    else:
+        data_start = all_rows[-1] + 1 if all_rows else data_start
 
-    if text_cols and num_cols:
-        return min(text_cols)
-
-    return -1
-
-
-# ── Helpers ──
-
-
-def _is_numeric(s: str) -> bool:
-    try:
-        float(s)
-        return True
-    except ValueError:
-        return False
+    return tuple(extended), data_start

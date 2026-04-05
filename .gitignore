@@ -11,8 +11,8 @@ build/
 .coverage
 htmlcov/
 result.xml
-tests/docs/*
 .venv
 tests/fixtures
 tests/test_real_files.py
 tests/docs
+tests/output

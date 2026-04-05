@@ -99,8 +99,8 @@ def test_title_row_single_value():
     assert 2 in t.header_rows
 
 
-def test_row_meta_col_detection():
-    """Leftmost text column in data region → row_meta_col."""
+def test_row_meta_col_not_in_boundary():
+    """TableBoundary no longer carries row_meta_col; detection is hint-only."""
     grid = {
         1: {1: "State", 2: "Population", 3: "Area"},
         2: {1: "Alabama", 2: "5000000", 3: "52419"},
@@ -108,7 +108,7 @@ def test_row_meta_col_detection():
     }
     tables = detect_tables(grid, {})
     assert len(tables) == 1
-    assert tables[0].row_meta_col == 1
+    assert not hasattr(tables[0], "row_meta_col")
 
 
 def test_empty_grid():
@@ -193,13 +193,11 @@ def test_auto_detect_header_tags():
     assert any("total_number" in t for t in tags)
 
 
-def test_auto_detect_row_meta():
-    """State column (text in data rows) should be detected as row-key."""
+def test_auto_detect_no_row_meta():
+    """Auto-detect mode should not produce row-key; all columns are child tags."""
     result = transform(SHEET_XML, SHARED_STRINGS)
     root = etree.fromstring(result.encode("utf-8"))
-    row_key = root.find("schema/row-key")
-    if row_key is not None:
-        assert row_key.get("attribute") == "state"
+    assert root.find("schema/row-key") is None
 
 
 def test_auto_detect_records():

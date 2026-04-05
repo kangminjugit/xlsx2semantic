@@ -24,6 +24,7 @@ def _process_sheet(
     shared_strings: list[str],
     style_resolver: StyleResolver,
     layout_hint: TableLayoutHint | None,
+    include_trace: bool,
 ) -> tuple[str, str, str]:
     """Process a single worksheet — designed to run in a worker process.
 
@@ -31,7 +32,7 @@ def _process_sheet(
         (entry_name, semantic_xml, cell_xml)
     """
     sheet_data = scan_sheet(entry_xml, shared_strings)
-    sem = semantic_transform(sheet_data, shared_strings, layout_hint)
+    sem = semantic_transform(sheet_data, shared_strings, layout_hint, include_trace=include_trace)
     cell = transform_sheet(sheet_data, shared_strings, style_resolver)
     return entry_name, sem, cell
 
@@ -45,6 +46,7 @@ def parse(
     header_range: str | None = None,
     row_meta_col: str | None = None,
     max_workers: int | None = None,
+    include_trace: bool = False,
 ) -> ParseResult:
     """Parse XLSX bytes into structured result.
 
@@ -68,6 +70,7 @@ def parse(
         "xml_entry_count": len(xml_entries),
         "xml_entry_names": list(xml_entries.keys()),
         "raw": raw,
+        "include_trace": include_trace,
     }
 
     if raw:
@@ -109,7 +112,7 @@ def parse(
             futures = {
                 executor.submit(
                     _process_sheet,
-                    name, xml, shared_strings, style_resolver, layout_hint,
+                    name, xml, shared_strings, style_resolver, layout_hint, include_trace,
                 ): name
                 for name, xml in sheet_entries.items()
             }
@@ -120,7 +123,7 @@ def parse(
     else:
         for entry_name, entry_xml in sheet_entries.items():
             sheet_data = scan_sheet(entry_xml, shared_strings)
-            sem = semantic_transform(sheet_data, shared_strings, layout_hint)
+            sem = semantic_transform(sheet_data, shared_strings, layout_hint, include_trace=include_trace)
             semantic_xml[entry_name] = sem
             cell = transform_sheet(sheet_data, shared_strings, style_resolver)
             cell_xml[entry_name] = cell
@@ -144,6 +147,7 @@ def parse_file(
     header_range: str | None = None,
     row_meta_col: str | None = None,
     max_workers: int | None = None,
+    include_trace: bool = False,
 ) -> ParseResult:
     """Parse an XLSX file from disk.
 
@@ -170,4 +174,5 @@ def parse_file(
         header_range=header_range,
         row_meta_col=row_meta_col,
         max_workers=max_workers,
+        include_trace=include_trace,
     )

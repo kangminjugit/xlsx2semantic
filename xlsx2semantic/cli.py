@@ -30,6 +30,7 @@ def main(
     title_range: Optional[str] = typer.Option(None, "--title-range", help='Title range, e.g. "B2:Z2" or "B2:*2"'),
     header_range: Optional[str] = typer.Option(None, "--header-range", help='Header range, e.g. "B4:Z6" or "B4:**"'),
     row_meta_col: Optional[str] = typer.Option(None, "--row-meta-col", help='Row meta column, e.g. "B"'),
+    include_trace: bool = typer.Option(False, "--include-trace", help="Append semantic decision trace to XML output"),
     sheet: Optional[str] = typer.Option(None, "--sheet", help="Sheet name filter (default: all sheets)"),
     mode: str = typer.Option(
         "semantic",
@@ -44,6 +45,7 @@ def main(
         title_range=title_range,
         header_range=header_range,
         row_meta_col=row_meta_col,
+        include_trace=include_trace,
     )
 
     # Select output based on mode

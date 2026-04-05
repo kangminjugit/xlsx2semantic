@@ -56,7 +56,14 @@ def test_star_both_header():
 def test_row_meta_col():
     hint = TableLayoutHint.create(row_meta_col="B")
     assert hint is not None
-    assert hint.row_meta_col_num == 2
+    assert hint.row_meta_col_nums == (2,)
+    assert hint.has_row_meta_col
+
+
+def test_row_meta_col_range():
+    hint = TableLayoutHint.create(row_meta_col="A:C")
+    assert hint is not None
+    assert hint.row_meta_col_nums == (1, 2, 3)
     assert hint.has_row_meta_col
 
 
@@ -87,4 +94,4 @@ def test_combined_params():
     assert hint.header_start_row == 4
     assert hint.header_end_row == 6
     assert hint.header_end_col == -1
-    assert hint.row_meta_col_num == 2
+    assert hint.row_meta_col_nums == (2,)

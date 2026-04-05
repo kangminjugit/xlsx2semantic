@@ -105,6 +105,8 @@ def _resolve_value(
     shared_strings: list[str],
 ) -> str | None:
     """Resolve cell value from raw data."""
+    if cell_type == "e":
+        return None
     if raw_value is not None:
         if cell_type == "s" and shared_strings:
             try:
@@ -115,9 +117,6 @@ def _resolve_value(
                 pass
             return raw_value
         return raw_value
-
-    if formula:
-        return formula
 
     return None
 

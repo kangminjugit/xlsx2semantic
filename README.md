@@ -8,11 +8,11 @@ Raw Excel XML is unreadable — cell references like `<c r="B7" t="s"><v>74</v><
 ```
 Before (raw OOXML)                          After (semantic XML)
 ─────────────────────                       ────────────────────
-<c r="B7" s="59" t="s">                    <record row="7" state="Alabama">
-  <v>74</v>                                   <total_number>745938</total_number>
-</c>                                          <total_percent>100</total_percent>
-<c r="C7" s="60">                           </record>
-  <v>745938</v>
+<c r="B7" s="59" t="s">                    <record row="7">
+  <v>74</v>                                   <state>Alabama</state>
+</c>                                          <total_number>745938</total_number>
+<c r="C7" s="60">                             <total_percent>100</total_percent>
+  <v>745938</v>                             </record>
 </c>
 ```
 
@@ -22,10 +22,11 @@ Before (raw OOXML)                          After (semantic XML)
 |---------|---------------|
 | LLMs can't parse raw OOXML cell references | Headers become tag names, data becomes readable records |
 | Shared strings are just index numbers | Automatically resolved to actual text |
-| Merged cells break structure | Propagated correctly across the grid |
-| Multi-level headers are ambiguous | Combined into hierarchical tag names |
+| Merged cells break structure | Horizontal and vertical merges propagated correctly across the grid |
+| Multi-level headers produce redundant tag names | Only the minimum levels needed for uniqueness are used |
 | Style indices are opaque | Resolved to human-readable font, color, format info |
 | One sheet with multiple tables | Structural anchors auto-detect each table region |
+| Formula error values (`#REF!`, `#DIV/0!`, …) | Filtered out — error cells are treated as empty |
 
 ## Quick Start
 
@@ -47,22 +48,41 @@ for sheet, xml in result.semantic_xml.items():
     print(xml)
 ```
 
+판단 근거까지 보고 싶으면:
+
+```python
+result = parse_file("enrollment.xlsx", include_trace=True)
+print(result.semantic_xml["xl/worksheets/sheet1.xml"])
+```
+
+이 경우 출력 XML에 `<trace>`가 추가되어 선택된 `title/header/data-start-row`, 최종 confidence, 행별 점수가 함께 기록됩니다.
+
+```xml
+<trace mode="auto" confidence="0.922">
+  <selected header-rows="4,5" data-start-row="6"/>
+  <evidence name="header_block" score="1.411"/>
+  <row index="4" role="header" title-score="0.250" header-score="0.913" data-score="0.300"/>
+</trace>
+```
+
 Output:
 
 ```xml
 <semantic-table>
   <title>Public school enrollment by race/ethnicity</title>
   <schema>
-    <row-key index="2" attribute="state"/>
+    <column index="2" tag="state"/>
     <column index="3" tag="total_number"/>
     <column index="4" tag="total_percent"/>
   </schema>
   <records count="52">
-    <record row="8" state="Alabama">
+    <record row="8">
+      <state>Alabama</state>
       <total_number>745938</total_number>
       <total_percent>100</total_percent>
     </record>
-    <record row="9" state="Alaska">
+    <record row="9">
+      <state>Alaska</state>
       <total_number>132731</total_number>
       <total_percent>100</total_percent>
     </record>
@@ -86,6 +106,7 @@ xlsx2semantic data.xlsx -o output.xml
 xlsx2semantic data.xlsx --mode cell      # enriched <cell> tags
 xlsx2semantic data.xlsx --mode raw-xml   # original OOXML
 xlsx2semantic data.xlsx --mode all       # everything
+xlsx2semantic data.xlsx --include-trace  # append semantic decision trace
 ```
 
 Install CLI extras: `pip install xlsx2semantic[cli]`
@@ -95,10 +116,10 @@ Install CLI extras: `pip install xlsx2semantic[cli]`
 xlsx2semantic uses a [SpreadsheetLLM](https://arxiv.org/abs/2407.09025)-inspired approach to automatically detect table regions without manual hints:
 
 1. **Cell clustering** — Non-empty cells are grouped into connected regions by row/column proximity. Clusters separated by empty rows or columns become separate tables.
-2. **Title detection** — Full-width merged cells at the top of a region are recognized as titles.
-3. **Header detection** — Row heterogeneity (text/numeric ratio) identifies header rows vs data rows. Text-dominant rows at the top of a cluster become headers; the first numeric-majority row starts the data region.
-4. **Multi-level header merging** — Hierarchical headers across multiple rows are combined into structured tag names (e.g. `학생_수용_현황_1_신청_학생_수_1학년`).
-5. **Row-key auto-detection** — The leftmost column that is predominantly text (>80%) while other columns are numeric is automatically identified as the row key.
+2. **Title detection** — Full-width merged cells or sparse single-value rows at the top of a region are recognized as titles.
+3. **Header detection** — By default, the first non-title row is treated as the single header row. If header cells are vertically merged downward (spanning multiple rows), those rows are automatically absorbed into the header block.
+4. **Minimum-unique tag names** — Multi-level headers are combined into the shortest tag name that remains unique across all columns. Parent levels are added only when the leaf level alone would be ambiguous.
+5. **Noise filtering** — Data rows whose values exactly match header labels (repeated template headers) are automatically skipped.
 
 ### Single Table
 
@@ -132,9 +153,13 @@ result = parse_file(
     "report.xlsx",
     title_range="B2:*2",       # title rows (B2, cols to end of sheet)
     header_range="B4:*6",      # header area (rows 4-6, cols to end)
-    row_meta_col="B",          # row label column → becomes record attribute
+    row_meta_col="B",          # single column → becomes record attribute
+    # row_meta_col="A:C",      # column range → all three become record attributes
+    header_rows=2,             # assume 2 header rows (default: 1)
 )
 ```
+
+`header_rows` controls how many rows are treated as column headers in auto-detect mode. Use it when a sheet has a fixed multi-level header that vertical merge expansion alone cannot determine.
 
 | Pattern | Meaning |
 |---------|---------|
@@ -143,9 +168,23 @@ result = parse_file(
 | `B4:Z*` | Col B–Z, row 4 to **end of sheet** |
 | `B4:**` | Col B to end, row 4 to end |
 
+When `row_meta_col` is provided, the specified columns are rendered as record **attributes** instead of child tags:
+
+```xml
+<!-- row_meta_col="B" -->
+<record row="8" state="Alabama">
+  <total_number>745938</total_number>
+</record>
+
+<!-- row_meta_col="A:C" (multi-column) -->
+<record row="8" 대분류="식품" 중분류="음료" 소분류="탄산음료">
+  <매출액>1500000</매출액>
+</record>
+```
+
 ## Multi-Level Header Support
 
-Real-world spreadsheets often have hierarchical headers spanning multiple rows. xlsx2semantic merges them into a single, structured tag name — both in auto-detect mode and with explicit hints.
+Real-world spreadsheets often have hierarchical headers spanning multiple rows. xlsx2semantic uses only the **minimum levels needed** to make each tag name unique — parent levels are added only when the leaf alone would be ambiguous.
 
 ```
 Original Excel layout (rows 4–6):
@@ -159,17 +198,27 @@ These multi-level headers become:
 
 ```xml
 <schema>
-  <row-key index="2" attribute="state"/>
+  <column index="2" tag="state"/>
   <column index="3" tag="total_number"/>
   <column index="4" tag="total_percent"/>
-  <column index="5" tag="race_ethnicity_american_indian_number"/>
-  <column index="6" tag="race_ethnicity_american_indian_percent"/>
-  <column index="7" tag="race_ethnicity_asian_number"/>
-  <column index="8" tag="race_ethnicity_asian_percent"/>
+  <column index="5" tag="american_indian_number"/>
+  <column index="6" tag="american_indian_percent"/>
+  <column index="7" tag="asian_number"/>
+  <column index="8" tag="asian_percent"/>
 </schema>
 ```
 
-Each header level is joined with `_`, so the full hierarchy is preserved in a flat, LLM-readable tag name. Duplicate values from merged cells are automatically deduplicated.
+`Number` and `Percent` appear in multiple columns, so one parent level (`American Indian`, `Asian`, etc.) is added to disambiguate. The top-level `Race/Ethnicity` is dropped because it is not needed for uniqueness. Duplicate values from merged cells are automatically deduplicated.
+
+### Vertical Merge Extension
+
+When header cells are vertically merged (e.g. a column label spanning rows 1–3), xlsx2semantic automatically extends the header block to include all covered rows:
+
+```
+Row 1: | 대여소번호 (merged ↓) | 소재지(위치) ──────────── | 설치시기 (merged ↓) |
+Row 2: | (merged)             | 자치구 | 상세주소 | 위도 | 경도 | (merged)          |
+       └── both rows become headers; data starts at row 3
+```
 
 ## Three Output Layers
 
@@ -207,8 +256,8 @@ Every opaque attribute is resolved:
 1. **ZIP Extract** — XLSX is a ZIP archive. Extract all XML entries.
 2. **Shared Strings** — Resolve `<v>74</v>` → `"Alabama"` via `sharedStrings.xml`.
 3. **Style Resolve** — Map `s="59"` → font, number format, fill, alignment via `styles.xml`.
-4. **Structural Anchor Detection** — Cluster non-empty cells into table regions; detect titles, headers, data boundaries, and row-key columns.
-5. **Semantic Transform** — Generate semantic XML for each detected table.
+4. **Structural Anchor Detection** — Cluster non-empty cells into table regions; detect titles, headers (with vertical merge extension), and data boundaries.
+5. **Semantic Transform** — Generate minimum-unique tag names and emit one `<record>` per data row.
 
 ### Performance
 
